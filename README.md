@@ -20,9 +20,9 @@ Pipeline de datos end-to-end con arquitectura **Medallion** (Bronze → Silver �
 |---|---|
 | **Nombre** | Open-Meteo |
 | **URL** | https://open-meteo.com/en/docs |
-| **Endpoint usado** | API histórica (`archive-api.open-meteo.com/v1/archive`) |
+| **Endpoints usados** | Histórico: `archive-api.open-meteo.com/v1/archive` (carga inicial) · Forecast: `api.open-meteo.com/v1/forecast` (actualización horaria de los días recientes) |
 | **Auth / API key** | Sin auth, no necesita API key |
-| **Descripción** | Devuelve datos meteorológicos para las coordenadas que se consulten. Usamos la serie **diaria** histórica. |
+| **Descripción** | Devuelve datos meteorológicos diarios para las coordenadas que se consulten. El histórico aporta los años de datos; el forecast mantiene el pipeline actualizado cada hora, cubriendo el atraso de ~5 días con que publica la API histórica. |
 
 ## Decisiones de análisis
 
@@ -30,7 +30,7 @@ Pipeline de datos end-to-end con arquitectura **Medallion** (Bronze → Silver �
   - Purmamarca, Jujuy (montaña)
   - San Carlos de Bariloche, Río Negro (montaña y lagos)
   - Puerto Iguazú, Misiones (selva)
-- **Período:** desde el 1/1/2021 hasta hoy menos ~5 días (demora de la API). El primer arranque carga todo el histórico y después se suman solo los días nuevos.
+- **Período:** desde el 1/1/2021 hasta el día de hoy. El histórico (hasta hoy menos ~5 días, por la demora de publicación de la API) entra como carga inicial; el forecast completa los días recientes y se actualiza cada hora. El primer arranque carga todo el histórico y después se suman solo los días nuevos.
 - **Granularidad diaria:** permite comparar el mismo mes entre distintos años y calcular qué porcentaje de días fueron agradables, lluviosos o extremos.
 - **Zona horaria:** consultamos con `timezone=auto`, así las fechas quedan en la hora local de cada destino.
 - **Variables seleccionadas:**
@@ -48,7 +48,7 @@ Pipeline de datos end-to-end con arquitectura **Medallion** (Bronze → Silver �
 
 ```mermaid
 flowchart LR
-    API[Open-Meteo<br/>API histórica] --> B[g06_bronze<br/>JSON crudo]
+    API[Open-Meteo<br/>histórico + forecast] --> B[g06_bronze<br/>JSON crudo]
     B -- asset bronze_openmeteo --> S[g06_silver<br/>tabla limpia y validada]
     S -- asset silver_openmeteo --> G[g06_gold<br/>modelo estrella y vistas]
     G --> D[Dashboard<br/>Streamlit]
@@ -62,6 +62,11 @@ Guarda en el schema `bronze` la respuesta de la API **tal cual**, en formato `JS
 
 Tabla `bronze.openmeteo`: una fila por destino y corrida, con `destino`, `latitud`, `longitud`, `fecha_desde`, `fecha_hasta`, `respuesta_json`, `source` e `ingested_at`. Carga incremental: consulta la última `fecha_hasta` de cada destino y pide solo los días que faltan.
 
+Combina **dos fuentes** de Open-Meteo:
+
+- **Histórico** (`archive`): se trae una sola vez como carga inicial, desde el 1/1/2021. Aporta los años de datos que necesita la pregunta.
+- **Forecast**: se consulta **cada hora** para sumar los días recientes que el histórico publica con ~5 días de atraso. Así el pipeline se mantiene actualizado (último dato con menos de una hora de antigüedad) y sigue acumulando datos en cada corrida.
+
 ### Silver: datos limpios y validados
 
 Convierte el JSON a una tabla `silver.clima_diario` con una fila por destino y día, según el contrato de datos (ver [`Contrato-silver-propuesta.md`](Contrato-silver-propuesta.md)):
@@ -69,7 +74,7 @@ Convierte el JSON a una tabla `silver.clima_diario` con una fila por destino y d
 - **Clave:** `destino` + `fecha`.
 - **Tipos:** `fecha` DATE, el resto DECIMAL, `destino` VARCHAR.
 - **Renombrado** de variables a nombres en español con unidad explícita.
-- **Limpieza y chequeos de calidad:** se descartan los registros sin destino o fecha; los valores imposibles (precipitación o ráfagas negativas, luz fuera de 0 a 86400 segundos, o temperaturas con `mínima ≤ media ≤ máxima` incumplido) quedan en `NULL`; y si hay varias ingestas del mismo `destino` + `fecha`, se conserva una sola (la más completa y reciente).
+- **Limpieza y chequeos de calidad:** se descartan los registros sin destino o fecha; los valores imposibles (precipitación o ráfagas negativas, luz fuera de 0 a 86400 segundos, o temperaturas con `mínima ≤ media ≤ máxima` incumplido) quedan en `NULL`; y si un mismo `destino` + `fecha` aparece en varias ingestas o en las dos fuentes, se conserva una sola fila: entre fuentes distintas **gana el histórico sobre el forecast**, y entre ingestas de la misma fuente, la más reciente.
 - Es **idempotente**: se puede volver a correr sin duplicar filas.
 
 ### Gold: modelo estrella
